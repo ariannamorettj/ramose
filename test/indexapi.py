@@ -20,6 +20,9 @@ from requests import get
 from rdflib import Graph, URIRef
 from re import sub
 from json import loads
+from datetime import datetime
+from bs4 import BeautifulSoup
+import re
 
 
 def lower(s):
@@ -81,8 +84,12 @@ def merge(res, *args):
 def split_dois(s):
     return "\"%s\"" % "\" \"".join(s.split("__")),
 
+def split_pmids(s):
+    return "\"%s\"" % "\" \"".join(s.split("__")),
 
-def metadata(res, *args):
+
+def metadata(res, *args): #res è la tabella di sparql. la prende e inizia a fare delle operazioni. parte non dalla prima riga (intestazione) ma dalla riga successiva
+    #recupera field secondo, perché la forma è sempre quella e so che è
     # doi, reference, citation_count
     header = res[0]
     doi_field = header.index("doi")
@@ -271,6 +278,96 @@ def __datacite_parser(doi):
         pass  # do nothing
 
 
+def __nih_parser(pmid):
+    api = "https://pubmed.ncbi.nlm.nih.gov/%s"
+    pmid_sep = str(pmid) + "%s"
+    display_opt = "/?format=pubmed"
+
+    try:
+        r = get(api % pmid_sep % display_opt,
+                headers={"User-Agent": "NOCI REST API (via OpenCitations - "
+                                       "http://opencitations.net; mailto:contact@opencitations.net)"}, timeout=30)
+        if r.status_code == 200:
+            r.encoding = "utf-8"
+            soup = BeautifulSoup(r.text, features="lxml")
+            body = str(soup.find(id="article-details"))
+
+            authors = _get_author_nih(body)
+
+
+            year = ""
+            nih_date = _get_date_nih(body)
+            if nih_date is not None:
+                year = __normalise(nih_date)
+
+            title = ""
+            nih_title = _get_title_nih(body)
+            if nih_title is not None:
+                title = __create_title(nih_title)
+
+            source_title = ""
+            nih_cont_title = _get_cont_title_nih(body)
+            if nih_cont_title is not None:
+                source_title = __create_title(nih_cont_title)
+
+            volume = ""
+            issue = ""
+            page = ""
+            source_id = ""
+
+            print (["; ".join(authors), year, title, source_title, volume, issue, page, source_id])
+            return ["; ".join(authors), year, title, source_title, volume, issue, page, source_id]
+
+    except Exception as e:
+        pass  # do nothing
+
+def _get_author_nih(txt_obj):
+    result = []
+    authors = re.findall("FAU\s+-\s+((([A-Z])\w*('|-|\.)?)(\s*([A-Z])\w*('|-|\.)?)*,\s*(([A-Z])([^\S\r\n][A-Z])*))", txt_obj)
+    for i in authors:
+        author = re.search("(([A-Z])\w*('|-|\.)?)(\s*([A-Z])\w*('|-|\.)?)*,\s*(([A-Z])([^\S\r\n][A-Z])*)", str(i)).group(0)
+        result.append(__normalise(author))
+    return result
+
+def _get_title_nih(txt_obj):
+    title = re.search("TI\s+-\s+([^\n]+)", txt_obj).group(1)
+    re_search = re.search("([^\n]+)", title)
+    if re_search is not None:
+        result = re_search.group(0)
+    return result
+
+def _get_cont_title_nih(txt_obj):
+    cont_title = re.search("JT\s+-\s+([^\n]+)", txt_obj).group(1)
+    re_search = re.search("([^\n]+)", cont_title)
+    if re_search is not None:
+        result = re_search.group(0)
+    return result
+
+
+def _get_date_nih(txt_obj):
+    date = re.search("DP\s+-\s+(\d{4}(\s?(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec))?(\s?((3[0-1])|([1-2][0-9])|([0]?[1-9])))?)", txt_obj).group(1)
+    re_search = re.search("(\d{4})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+((3[0-1])|([1-2][0-9])|([0]?[1-9]))", date)
+    if re_search is not None:
+        result = re_search.group(0)
+        datetime_object = datetime.strptime(result, '%Y %b %d')
+        return datetime.strftime(datetime_object, '%Y-%m-%d')
+    else:
+        re_search = re.search("(\d{4})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)", date)
+        if re_search is not None:
+            result = re_search.group(0)
+            datetime_object = datetime.strptime(result, '%Y %b')
+            return datetime.strftime(datetime_object, '%Y-%m')
+        else:
+            re_search = re.search("(\d{4})", date)
+            if re_search is not None:
+                result = re.search("(\d{4})", date).group(0)
+                datetime_object = datetime.strptime(result, '%Y')
+                return datetime.strftime(datetime_object, '%Y')
+            else:
+                return None
+
+
+
 def oalink(res, *args):
     base_api_url = "https://api.unpaywall.org/v2/%s?email=contact@opencitations.net"
 
@@ -287,6 +384,69 @@ def oalink(res, *args):
         try:
             r = get(base_api_url % citing_doi,
                     headers={"User-Agent": "COCI REST API (via OpenCitations - "
+                                           "http://opencitations.net; mailto:contact@opencitations.net)"}, timeout=30)
+            if r.status_code == 200:
+                res_json = loads(r.text)
+                if "best_oa_location" in res_json and res_json["best_oa_location"] is not None and \
+                        "url" in res_json["best_oa_location"]:
+                    row.append(res_json["best_oa_location"]["url"])
+                else:
+                    row.append("")  # empty element
+            else:
+                row.append("")  # empty element
+        except Exception as e:
+            row.append("")  # empty element
+
+    return res, True
+
+
+
+def metadata_pmid(res, *args):
+    # pmid, reference, citation_count
+    header = res[0]
+    pmid_field = header.index("doi")
+    additional_fields = ["author", "year", "title", "source_title", "volume", "issue", "page", "source_id"]
+
+    header.extend(additional_fields)
+
+    rows_to_remove = []
+
+    for row in res[1:]:
+        citing_pmid = row[pmid_field][1]
+
+        r = None
+        for p in (__nih_parser):
+            if r is None:
+                r = p(citing_pmid)
+
+        if r is None or all([i in ("", None) for i in r]):
+            rows_to_remove.append(row)
+        else:
+            row.extend(r)
+
+    for row in rows_to_remove:
+        res.remove(row)
+
+    return res, True
+
+
+
+def oalinkpmid(res, *args):
+    base_api_url = "https://api.unpaywall.org/v2/%s?email=contact@opencitations.net"
+
+    # pmid, reference, citation_count
+    header = res[0]
+    pmid_field = header.index("doi") #?
+    additional_fields = ["oa_link"]
+
+    header.extend(additional_fields)
+
+    for row in res[1:]:
+        citing_pmid = row[pmid_field][1]
+
+        try:
+            r = get(base_api_url % citing_pmid,
+                    headers={"User-Agent": "NOCI REST API (via OpenCitations - "
                                            "http://opencitations.net; mailto:contact@opencitations.net)"}, timeout=30)
             if r.status_code == 200:
                 res_json = loads(r.text)
